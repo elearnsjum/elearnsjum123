@@ -648,71 +648,8 @@ class Reflector:
             # --- VETO LOGIC END ---
 
             # 新增：钉钉漏洞推送 —— 当确认漏洞时立即推送并停止测试
-            try:
-                from core.dingtalk_notifier import DingTalkNotifier
-                from conf.config import (
-                    DINGTALK_ENABLED, DINGTALK_WEBHOOK, DINGTALK_SECRET,
-                    DINGTALK_STOP_ON_VULN
-                )
-
-                if DINGTALK_ENABLED and DINGTALK_WEBHOOK and DINGTALK_SECRET:
-                    # 检查 causal_graph_updates 中是否有确认的漏洞
-                    cg_updates = reflection_data.get("causal_graph_updates", {})
-                    confirmed_vulns = []
-                    if cg_updates and "nodes" in cg_updates:
-                        for node in cg_updates["nodes"]:
-                            if node.get("node_type") in ("Vulnerability", "ConfirmedVulnerability"):
-                                confirmed_vulns.append(node)
-
-                    # 同时检查 staged_causal_nodes
-                    for node in (staged_causal_nodes or []):
-                        if isinstance(node, dict) and node.get("node_type") in ("Vulnerability", "ConfirmedVulnerability"):
-                            if node not in confirmed_vulns:
-                                confirmed_vulns.append(node)
-
-                    if confirmed_vulns:
-                        notifier = DingTalkNotifier(
-                            webhook_url=DINGTALK_WEBHOOK,
-                            secret=DINGTALK_SECRET
-                        )
-
-                        for vuln_node in confirmed_vulns:
-                            # 构建漏洞信息
-                            vuln_info = self._extract_vulnerability_info(vuln_node, execution_log)
-
-                            # 发送钉钉通知
-                            success = await notifier.send_vulnerability_alert(vuln_info)
-                            if success:
-                                _get_console().print(
-                                    f"[DingTalk] 漏洞推送成功: {vuln_info.get('title', 'Unknown')}",
-                                    style="bold green"
-                                )
-                            else:
-                                _get_console().print(
-                                    "[DingTalk] 漏洞推送失败",
-                                    style="bold red"
-                                )
-
-                            # 如果配置为发现漏洞后停止，创建 halt 信号
-                            if DINGTALK_STOP_ON_VULN:
-                                import os, json, tempfile
-                                halt_file = os.path.join(tempfile.gettempdir(), f"{graph_manager.task_id}.halt")
-                                halt_payload = {
-                                    "reason": "vulnerability_confirmed",
-                                    "vulnerability": vuln_info,
-                                    "timestamp": time.time()
-                                }
-                                with open(halt_file, "w", encoding="utf-8") as f:
-                                    json.dump(halt_payload, f, ensure_ascii=False)
-                                _get_console().print(
-                                    f"[DingTalk] 已发现有效漏洞，测试任务已自动停止: {vuln_info.get('title', '')}",
-                                    style="bold yellow"
-                                )
-                                # 在 reflection_data 中标记停止原因
-                                reflection_data["stop_reason"] = "vulnerability_confirmed"
-                                reflection_data["confirmed_vulnerability"] = vuln_info
-            except Exception as e:
-                _get_console().print(f"[DingTalk] 推送过程出错: {e}", style="yellow")
+            if graph_manager:
+                await self._notify_dingtalk_from_graph(graph_manager)
 
             try:
                 import os
@@ -757,6 +694,12 @@ class Reflector:
         """
         从漏洞节点和执行日志中提取完整的漏洞信息。
 
+        智能提取策略：
+        1. 从节点字段直接提取（如果存在）
+        2. 从执行日志中解析工具调用提取 PoC / 证据
+        3. 从 description / exploit_type / 节点 ID 推断漏洞类型和标题
+        4. 生成有针对性的修复建议
+
         Args:
             vuln_node: 因果图中的漏洞节点
             execution_log: 执行日志（用于补充PoC和证据）
@@ -764,41 +707,38 @@ class Reflector:
         Returns:
             结构化的漏洞信息字典
         """
-        title = vuln_node.get("title", "未命名漏洞")
-        vuln_type = vuln_node.get("vulnerability", vuln_node.get("exploit_type", "未知类型"))
+        # ---- 1. 提取基础字段 ----
         description = vuln_node.get("description", "")
-        severity = "高危"  # 默认
+        node_id = vuln_node.get("id", "")
 
-        # 根据cvss评分判断严重程度
-        cvss = vuln_node.get("cvss_score", 0)
-        if isinstance(cvss, (int, float)):
-            if cvss >= 9.0:
-                severity = "严重"
-            elif cvss >= 7.0:
-                severity = "高危"
-            elif cvss >= 4.0:
-                severity = "中危"
-            elif cvss > 0:
-                severity = "低危"
+        # 漏洞类型：exploit_type > 从description推断 > 从node_id推断 > 未知
+        vuln_type = vuln_node.get("exploit_type", "")
+        if not vuln_type:
+            vuln_type = self._infer_vuln_type_from_text(description, node_id)
 
-        # 构建PoC
-        poc_parts = []
-        known_exploits = vuln_node.get("known_exploits", [])
-        if known_exploits:
-            poc_parts.extend(known_exploits)
-        exploit_payload = vuln_node.get("exploit_payload", "")
-        if exploit_payload:
-            poc_parts.append(exploit_payload)
-        if not poc_parts:
-            poc_parts.append("请参考执行日志中的具体利用步骤")
+        # 标题：title > 用漏洞类型+描述生成
+        title = vuln_node.get("title", "")
+        if not title:
+            title = self._generate_title(vuln_type, description, node_id)
 
-        # 构建证据
-        evidence = vuln_node.get("evidence", "")
-        if not evidence and execution_log:
-            # 从执行日志中提取关键部分作为证据
-            evidence = execution_log[:1000] if len(execution_log) > 1000 else execution_log
+        # 严重程度
+        severity = self._classify_severity(vuln_node.get("cvss_score", 0), vuln_type)
 
-        # 构建修复建议
+        # 影响URL
+        affected_url = vuln_node.get("affected_url", vuln_node.get("host", vuln_node.get("target_url", "")))
+        if not affected_url and execution_log:
+            affected_url = self._extract_target_url(execution_log)
+
+        # ---- 2. 提取 PoC（优先顺序）----
+        poc = self._extract_poc(vuln_node, execution_log)
+
+        # ---- 3. 提取证据 ----
+        evidence = self._extract_evidence(vuln_node, execution_log)
+
+        # ---- 4. 构建复现步骤 ----
+        reproduction_steps = self._build_reproduction_steps(vuln_node, execution_log, affected_url)
+
+        # ---- 5. 修复建议 ----
         remediation = vuln_node.get("remediation", "")
         if not remediation:
             remediation = self._generate_remediation_advice(vuln_type)
@@ -808,28 +748,407 @@ class Reflector:
             "vuln_type": vuln_type,
             "severity": severity,
             "description": description or f"发现 {vuln_type} 类型漏洞",
-            "affected_url": vuln_node.get("affected_url", vuln_node.get("host", "")),
-            "poc": "\n\n".join(poc_parts),
+            "affected_url": affected_url,
+            "poc": poc,
             "evidence": evidence,
-            "reproduction_steps": vuln_node.get("exploitation_conditions", ["1. 访问目标URL", "2. 发送构造的恶意请求", "3. 验证漏洞存在"]),
+            "reproduction_steps": reproduction_steps,
             "remediation": remediation,
             "discovered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-    def _generate_remediation_advice(self, vuln_type: str) -> str:
-        """根据漏洞类型生成通用修复建议"""
-        advice_map = {
-            "sql_injection": "使用参数化查询/预处理语句，对用户输入进行严格过滤和转义",
-            "xss": "对用户输入进行HTML实体编码，实施CSP策略",
-            "rce": "禁止将用户输入传入系统命令执行函数，使用白名单验证",
-            "ssrf": "限制服务器端发起的请求目标，使用URL白名单",
-            "file_upload": "限制上传文件类型，重命名上传文件，隔离存储",
-            "auth_bypass": "强化身份验证逻辑，实施多因素认证",
-            "insecure_deserialization": "禁止使用不安全的反序列化，对序列化数据进行签名验证",
-            "lfi": "禁用文件包含功能，或使用白名单限制可包含的文件",
-            "rfi": "关闭远程文件包含，限制URL封装器",
+    # ------------------------------------------------------------------
+    # 以下辅助方法用于智能提取漏洞信息
+    # ------------------------------------------------------------------
+
+    def _generate_title(self, vuln_type: str, description: str, node_id: str) -> str:
+        """根据漏洞类型和描述生成标题"""
+        type_names = {
+            "sql_injection": "SQL注入", "xss": "XSS跨站脚本", "rce": "远程代码执行",
+            "ssrf": "SSRF服务器端请求伪造", "csrf": "CSRF跨站请求伪造",
+            "lfi": "LFI本地文件包含", "rfi": "RFI远程文件包含",
+            "file_upload": "任意文件上传", "auth_bypass": "认证绕过",
+            "insecure_deserialization": "不安全的反序列化",
+            "directory_traversal": "目录遍历", "command_injection": "命令注入",
+            "xxe": "XXE XML外部实体", "open_redirect": "URL跳转",
+            "info_leak": "信息泄露", "weak_password": "弱口令",
+            "user_enumeration": "用户枚举", "shiro_deserialization": "Shiro反序列化",
+            "jwt_bypass": "JWT认证绕过", "path_traversal": "路径遍历",
+            "idac": "越权访问", "sensitive_data_exposure": "敏感数据泄露",
+            "default_credentials": "默认凭据", "brute_force": "暴力破解",
         }
-        return advice_map.get(vuln_type.lower(), "建议对漏洞点进行代码审计，实施输入验证和输出编码")
+        cn_type = type_names.get(vuln_type.lower(), vuln_type)
+
+        # 从描述中提取关键短语作为标题
+        if description:
+            # 取描述的前30个字符或第一个句号前
+            short_desc = description.split("。")[0].split("，")[0].strip()
+            if len(short_desc) > 5:
+                return f"{cn_type}漏洞 - {short_desc[:40]}"
+
+        # 从node_id提取线索
+        if node_id:
+            for keyword, name in type_names.items():
+                if keyword.replace("_", "") in node_id.lower():
+                    return f"{name}漏洞"
+
+        return f"{cn_type}漏洞"
+
+    def _classify_severity(self, cvss_score: Any, vuln_type: str) -> str:
+        """根据CVSS评分和漏洞类型判断严重程度"""
+        # 有CVSS评分时优先使用
+        if cvss_score and isinstance(cvss_score, (int, float)):
+            if cvss_score >= 9.0:
+                return "严重"
+            elif cvss_score >= 7.0:
+                return "高危"
+            elif cvss_score >= 4.0:
+                return "中危"
+            elif cvss_score > 0:
+                return "低危"
+
+        # 无CVSS时根据漏洞类型推断
+        critical_types = {"rce", "command_injection", "sql_injection", "auth_bypass",
+                          "insecure_deserialization", "shiro_deserialization", "file_upload_rce"}
+        high_types = {"xss", "ssrf", "file_upload", "lfi", "info_leak_sensitive",
+                      "jwt_bypass", "sensitive_data_exposure", "user_enumeration"}
+        medium_types = {"csrf", "open_redirect", "directory_traversal", "weak_password",
+                        "default_credentials", "user_enumeration"}
+
+        vt_lower = vuln_type.lower().replace(" ", "_")
+        if vt_lower in critical_types:
+            return "严重"
+        elif vt_lower in high_types:
+            return "高危"
+        elif vt_lower in medium_types:
+            return "中危"
+        return "高危"  # 默认高危
+
+    def _infer_vuln_type_from_text(self, description: str, node_id: str = "") -> str:
+        """从描述文本中推断漏洞类型。优先级: description > node_id"""
+        desc_lower = description.lower() if description else ""
+        id_lower = node_id.lower() if node_id else ""
+
+        # description 中的关键词优先级更高（放前面）
+        # node_id 中的关键词容易误判（如 shiro_test_1 中的 "shiro"）
+        desc_priority_patterns = [
+            ("user_enumeration", ["用户枚举", "username enumeration", "枚举用户", "用户名枚举"]),
+            ("sql_injection", ["sql注入", "sql injection", "盲注", "报错注入", "延时注入", "union注入", "堆叠注入", "注入点", "注入漏洞"]),
+            ("xss", ["xss", "跨站脚本", "cross.site.script", "反射型xss", "存储型xss", "dom型xss"]),
+            ("rce", ["远程代码执行", "rce", "remote code execution", "代码执行"]),
+            ("command_injection", ["命令注入", "command injection", "命令执行"]),
+            ("ssrf", ["ssrf", "服务器端请求伪造", "server.side.request.forgery"]),
+            ("csrf", ["csrf", "跨站请求伪造", "cross.site.request.forgery"]),
+            ("lfi", ["lfi", "本地文件包含", "local file inclusion"]),
+            ("rfi", ["rfi", "远程文件包含", "remote file inclusion"]),
+            ("file_upload", ["文件上传", "file upload", "任意文件上传", "上传漏洞"]),
+            ("auth_bypass", ["认证绕过", "auth bypass", "未授权访问", "越权访问", "垂直越权", "水平越权"]),
+            ("xxe", ["xxe", "xml外部实体", "xml external entity"]),
+            ("directory_traversal", ["目录遍历", "directory traversal", "路径穿越"]),
+            ("path_traversal", ["路径遍历", "path traversal"]),
+            ("info_leak", ["信息泄露", "源码泄露", "配置文件泄露", "目录列表", "info leak", "git泄露", "svn泄露"]),
+            ("weak_password", ["弱口令", "weak password", "默认密码"]),
+            ("open_redirect", ["url跳转", "open redirect", "任意跳转", "未授权跳转"]),
+            ("jwt_bypass", ["jwt", "json web token", "token伪造", "token绕过"]),
+            ("sensitive_data_exposure", ["敏感数据泄露", "敏感信息泄露", "个人信息泄露", "数据泄露"]),
+            ("default_credentials", ["默认凭据", "默认账号", "默认口令"]),
+            ("idac", ["id越权", "越权"]),
+        ]
+
+        # 第一轮：从 description 推断（高优先级、精确匹配）
+        for vuln_type, keywords in desc_priority_patterns:
+            for kw in keywords:
+                if kw.lower() in desc_lower:
+                    return vuln_type
+
+        # 第二轮：从 description 推断通用类型
+        if "反序列化" in description or "deserialization" in desc_lower:
+            return "insecure_deserialization"
+        if "shiro" in desc_lower:
+            return "shiro_deserialization"
+
+        # 第三轮：从 node_id 推断（仅在 description 为空或无法推断时使用）
+        # 注意：更具体的类型放在前面（如 shiro_deserialization 在 insecure_deserialization 之前）
+        id_patterns = [
+            ("sql_injection", ["sql", "sqli", "injection"]),
+            ("xss", ["xss", "cross_site"]),
+            ("rce", ["rce", "remote_code"]),
+            ("ssrf", ["ssrf"]),
+            ("file_upload", ["upload", "fileupload"]),
+            ("auth_bypass", ["auth", "bypass", "unauth"]),
+            ("lfi", ["lfi", "file_include"]),
+            ("shiro_deserialization", ["shiro"]),
+            ("insecure_deserialization", ["deserialize", "serialization"]),
+            ("user_enumeration", ["user_enum", "enum_user"]),
+            ("directory_traversal", ["traversal", "directory"]),
+            ("info_leak", ["info_leak", "leak"]),
+        ]
+        for vuln_type, keywords in id_patterns:
+            for kw in keywords:
+                if kw.lower() in id_lower:
+                    return vuln_type
+
+        return "未知类型"
+
+    def _extract_poc(self, vuln_node: dict, execution_log: str) -> str:
+        """提取完整PoC：节点字段 > 执行日志 > 默认"""
+        # 1. 从节点字段提取
+        poc_parts = []
+        exploit_payload = vuln_node.get("exploit_payload", "")
+        if exploit_payload:
+            poc_parts.append(f"[Exploit Payload]\n{exploit_payload}")
+
+        known_exploits = vuln_node.get("known_exploits", [])
+        if known_exploits:
+            poc_parts.extend(known_exploits)
+
+        # 2. 从执行日志提取工具调用
+        if execution_log:
+            log_poc = self._extract_poc_from_execution_log(execution_log)
+            if log_poc:
+                poc_parts.append(log_poc)
+
+        if poc_parts:
+            return "\n\n".join(poc_parts)
+
+        return "PoC 提取失败，请查看完整执行日志"
+
+    def _extract_poc_from_execution_log(self, execution_log: str) -> str:
+        """从执行日志中提取关键的工具调用 payload 作为 PoC"""
+        import re
+
+        poc_blocks = []
+
+        # 提取 http_request 的 payload
+        # 提取 http_request 调用（兼容转义引号）
+        http_pattern = r'"tool"\s*:\s*"http_request"'
+        http_indices = [m.start() for m in re.finditer(http_pattern, execution_log)]
+
+        for idx in http_indices[-3:]:  # 取最近3个
+            # 提取该工具调用的参数块（从 tool 开始到下一个 "tool" 或 "status" 之前）
+            block_end = execution_log.find('"tool"', idx + 10)
+            if block_end == -1:
+                block_end = execution_log.find('"status"', idx)
+            if block_end == -1:
+                block_end = idx + 2000
+            block = execution_log[idx:block_end]
+
+            url = re.search(r'"url"\s*:\s*"([^"]+)"', block)
+            method = re.search(r'"method"\s*:\s*"([^"]+)"', block)
+
+            # body 可能包含转义引号，用非贪婪匹配到闭合引号
+            body_match = re.search(r'"body"\s*:\s*"(.+?)(?<!\\)"(?:\s*[,}])', block, re.DOTALL)
+            if not body_match:
+                # 备选：匹配简单body
+                body_match = re.search(r'"body"\s*:\s*"([^"]*)"', block)
+
+            lines = []
+            if method and url:
+                lines.append(f"{method.group(1).upper()} {url.group(1)}")
+            elif url:
+                lines.append(f"GET {url.group(1)}")
+
+            if body_match:
+                body_val = body_match.group(1).replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+                lines.append(f"Body:\n{body_val[:500]}")
+
+            if lines:
+                poc_blocks.append("\n".join(lines))
+
+        # 提取 shell_exec / python_exec 的 payload
+        exec_patterns = [
+            (r'"tool"\s*:\s*"shell_exec".*?"command"\s*:\s*"([^"]+)"', "Shell Command"),
+            (r'"tool"\s*:\s*"python_exec".*?"(?:script|code)"\s*:\s*"(.+?)(?:"\s*\}|"\s*,)', "Python Script"),
+            (r'"tool"\s*:\s*"python_exec".*?"script"\s*:\s*"((?:[^"]|\\.)+)"', "Python Script"),
+        ]
+
+        for pattern, label in exec_patterns:
+            matches = re.findall(pattern, execution_log, re.DOTALL)
+            for match in matches[-2:]:
+                clean = match.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"')
+                poc_blocks.append(f"[{label}]\n{clean[:800]}")
+
+        # 提取 SQL 注入 payload
+        sql_pattern = r'(union\s+select|select\s+.*from|insert\s+into|update\s+.*set|delete\s+from|and\s+\d+=\d+|or\s+\d+=\d+|sleep\s*\(|benchmark\s*\()'
+        sql_matches = re.findall(sql_pattern, execution_log, re.IGNORECASE)
+        if sql_matches:
+            # 提取包含 SQL payload 的整行
+            for line in execution_log.split('\n'):
+                for kw in ["union select", "' or '", "' and ", "sleep(", "benchmark("]:
+                    if kw.lower() in line.lower() and len(line) > 10:
+                        poc_blocks.append(f"[SQL Payload]\n{line.strip()[:500]}")
+                        break
+                if len(poc_blocks) > 8:
+                    break
+
+        # 去重
+        seen = set()
+        unique_blocks = []
+        for block in poc_blocks:
+            key = block[:50]
+            if key not in seen:
+                seen.add(key)
+                unique_blocks.append(block)
+
+        return "\n\n---\n\n".join(unique_blocks[:5]) if unique_blocks else ""
+
+    def _extract_evidence(self, vuln_node: dict, execution_log: str) -> str:
+        """提取验证证据：节点字段 > 执行日志关键结果 > 默认"""
+        # 1. 从节点字段提取
+        evidence = vuln_node.get("evidence", "")
+        if evidence:
+            return evidence
+
+        # 2. 从执行日志提取关键验证结果
+        if execution_log:
+            return self._extract_evidence_from_execution_log(execution_log)
+
+        return "验证证据未记录"
+
+    def _extract_evidence_from_execution_log(self, execution_log: str) -> str:
+        """从执行日志中提取关键的成功验证结果"""
+        import re
+
+        evidence_parts = []
+
+        # 提取 HTTP 响应中的成功指示
+        success_patterns = [
+            r'(HTTP/\d\.\d\s+200\s+OK.*?)(?:\n{2,}|\Z)',
+            r'(HTTP/\d\.\d\s+\d{3}.*?)(?:\n{2,}|\Z)',
+            r'"status_code"\s*:\s*(\d+)',
+            r'(验证成功|漏洞确认|存在漏洞|exploit successful|success)',
+        ]
+
+        for pattern in success_patterns[:2]:
+            matches = re.findall(pattern, execution_log, re.IGNORECASE | re.DOTALL)
+            for match in matches[:3]:
+                clean = match.strip()
+                if len(clean) > 10:
+                    evidence_parts.append(f"HTTP Response:\n{clean[:600]}")
+
+        # 提取关键返回数据（JSON/XML）
+        json_pattern = r'(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})'
+        json_matches = re.findall(json_pattern, execution_log)
+        for match in json_matches:
+            if any(kw in match for kw in ["success", "token", "password", "user", "admin", "flag"]):
+                evidence_parts.append(f"Response Data:\n{match[:500]}")
+                break
+
+        # 提取关键发现
+        key_findings = re.findall(r'(?:发现|找到|确认|成功)[：:]\s*(.+?)(?:\n|$)', execution_log)
+        for finding in key_findings[:3]:
+            evidence_parts.append(f"关键发现: {finding.strip()[:200]}")
+
+        # 去重并拼接
+        seen = set()
+        unique_parts = []
+        for part in evidence_parts:
+            key = part[:40]
+            if key not in seen:
+                seen.add(key)
+                unique_parts.append(part)
+
+        result = "\n\n".join(unique_parts[:4])
+        return result if result else execution_log[:500].strip()
+
+    def _extract_target_url(self, execution_log: str) -> str:
+        """从执行日志中提取目标URL"""
+        import re
+        url_pattern = r'(https?://[^\s"\'\)]+)'
+        matches = re.findall(url_pattern, execution_log)
+        if matches:
+            return matches[0].rstrip('/')
+        return ""
+
+    def _build_reproduction_steps(self, vuln_node: dict, execution_log: str, affected_url: str) -> list:
+        """构建复现步骤：节点字段 > 执行日志 > 默认"""
+        # 1. 从节点字段提取
+        steps = vuln_node.get("exploitation_conditions", [])
+        if steps:
+            return steps if isinstance(steps, list) else [steps]
+
+        # 2. 从执行日志推断
+        if execution_log:
+            inferred = self._infer_steps_from_execution_log(execution_log, affected_url)
+            if inferred:
+                return inferred
+
+        # 3. 默认步骤
+        url = affected_url or "目标URL"
+        return [
+            f"1. 访问目标地址: {url}",
+            "2. 构造并发送恶意请求",
+            "3. 观察响应，验证漏洞存在",
+        ]
+
+    def _infer_steps_from_execution_log(self, execution_log: str, affected_url: str) -> list:
+        """从执行日志中推断复现步骤"""
+        import re
+        steps = []
+
+        # 提取 http_request 的步骤
+        http_pattern = r'"tool"\s*:\s*"http_request".*?"params"\s*:\s*\{.*?\}'
+        http_matches = re.findall(http_pattern, execution_log, re.DOTALL)
+        for i, match in enumerate(http_matches[:4], 1):
+            url = re.search(r'"url"\s*:\s*"([^"]+)"', match)
+            method = re.search(r'"method"\s*:\s*"([^"]+)"', match)
+            body = re.search(r'"body"\s*:\s*"([^"]+)"', match)
+
+            parts = []
+            if method and url:
+                parts.append(f"发送 {method.group(1).upper()} 请求到 {url.group(1)}")
+            elif url:
+                parts.append(f"发送请求到 {url.group(1)}")
+            if body:
+                parts.append(f"，Payload: {body.group(1)[:100]}")
+
+            if parts:
+                steps.append(f"{i}. {''.join(parts)}")
+
+        # 提取 python_exec 的步骤
+        py_pattern = r'"tool"\s*:\s*"python_exec"'
+        py_matches = re.findall(py_pattern, execution_log)
+        for i, _ in enumerate(py_matches[:2], len(steps) + 1):
+            steps.append(f"{i}. 执行 Python 漏洞利用脚本")
+
+        # 提取 shell_exec 的步骤
+        sh_matches = re.findall(r'"tool"\s*:\s*"shell_exec"', execution_log)
+        for i, _ in enumerate(sh_matches[:2], len(steps) + 1):
+            steps.append(f"{i}. 执行 Shell 命令进行测试")
+
+        # 添加验证步骤
+        if steps:
+            steps.append(f"{len(steps) + 1}. 观察响应，确认漏洞可利用")
+
+        return steps
+
+    def _generate_remediation_advice(self, vuln_type: str) -> str:
+        """根据漏洞类型生成有针对性的修复建议"""
+        advice_map = {
+            "sql_injection": "1. 所有数据库查询必须使用参数化查询（PreparedStatement）或 ORM 框架\n2. 对用户输入进行白名单校验，拒绝特殊字符\n3. 启用数据库查询日志审计，及时发现异常 SQL",
+            "xss": "1. 对所有用户输入进行 HTML 实体编码（如 < 转义为 &lt;）\n2. 实施 CSP（内容安全策略）头限制脚本执行\n3. 使用现代框架的自动转义功能（如 React/Vue 的 {{ }} 插值）",
+            "rce": "1. 严禁将用户输入传入 eval()、system()、exec() 等代码执行函数\n2. 使用白名单校验用户输入，仅允许预期字符\n3. 部署 WAF 规则拦截常见 RCE payload",
+            "command_injection": "1. 使用参数化 API 代替字符串拼接命令（如 subprocess.run(['ls', '-l'])）\n2. 对用户输入实施严格的白名单过滤\n3. 以最小权限运行应用进程",
+            "ssrf": "1. 限制服务器端可访问的 URL 范围，使用白名单\n2. 禁用不必要的 URL 协议（file://、dict://、gopher://）\n3. 对解析后的 IP 进行校验，禁止访问内网地址",
+            "csrf": "1. 所有状态变更操作必须携带 CSRF Token 验证\n2. 检查请求头中的 Origin/Referer\n3. 对敏感操作增加二次确认（验证码、密码确认）",
+            "lfi": "1. 禁用动态文件包含功能\n2. 使用白名单限制可包含的文件路径\n3. 对用户传入的文件名进行 basename() 处理",
+            "rfi": "1. 关闭 allow_url_include 配置\n2. 禁用远程 URL 文件包含\n3. 使用白名单校验文件路径",
+            "file_upload": "1. 严格校验文件 MIME 类型和后缀名（白名单）\n2. 重命名上传文件，禁止保留原始文件名\n3. 上传文件存储在非 Web 可访问目录，禁止执行权限",
+            "auth_bypass": "1. 强化身份验证逻辑，所有接口必须校验登录状态\n2. 实施多因素认证（MFA）\n3. 对敏感接口增加操作权限校验（垂直/水平越权检查）",
+            "insecure_deserialization": "1. 禁用不安全的反序列化操作\n2. 对序列化数据实施签名验证（HMAC）\n3. 使用 JSON 等安全格式替代二进制序列化",
+            "shiro_deserialization": "1. 升级 Apache Shiro 到最新版本（>=1.7.1）\n2. 修改默认密钥，使用随机生成的强密钥\n3. 启用 rememberMe Cookie 加密并验证",
+            "xxe": "1. 禁用 XML 外部实体解析（setFeature(\"http://apache.org/xml/features/disallow-doctype-decl\", true)）\n2. 使用 JSON 替代 XML 数据交换格式\n3. 升级 XML 解析库到最新版本",
+            "directory_traversal": "1. 对用户传入的路径进行 normalize 和 realpath 处理\n2. 校验最终路径是否在允许的基目录内\n3. 拒绝包含 ../ 或 ..\\ 的路径",
+            "info_leak": "1. 生产环境关闭调试模式，隐藏详细错误信息\n2. 删除或限制访问 .git、.svn、.env、备份文件\n3. 统一返回标准化错误页面，不暴露系统内部信息",
+            "weak_password": "1. 强制实施密码复杂度策略（8位以上，含大小写+数字+特殊字符）\n2. 禁止使用常见弱口令，对接 Have I Been Pwned API\n3. 启用登录失败锁定和 MFA",
+            "user_enumeration": "1. 登录接口返回统一错误提示（如 \"用户名或密码错误\"）\n2. 增加验证码或速率限制防止自动化枚举\n3. 注册/找回密码接口不暴露用户是否存在",
+            "open_redirect": "1. 使用白名单限制跳转目标域名\n2. 使用内部映射表代替直接 URL 跳转\n3. 对跳转参数进行签名验证",
+            "jwt_bypass": "1. 使用强签名算法（RS256 而非 HS256/None）\n2. 服务端严格校验签名、过期时间和签发者\n3. JWT 密钥定期轮换，禁止硬编码",
+            "sensitive_data_exposure": "1. 对存储和传输中的敏感数据进行加密（AES-256）\n2. 实施数据脱敏，非必要不返回完整敏感字段\n3. 启用 HTTPS 并配置 HSTS",
+            "path_traversal": "1. 使用标准库函数规范化路径（os.path.abspath）\n2. 校验最终路径是否位于授权目录内\n3. 拒绝包含路径穿越字符的请求",
+            "default_credentials": "1. 系统首次安装后强制修改默认密码\n2. 建立默认凭据清单，部署时逐一检查\n3. 使用自动化工具扫描默认账号",
+            "idac": "1. 对每个接口实施权限校验（RBAC/ABAC）\n2. 禁止仅依赖前端隐藏控制权限\n3. 水平越权校验：确保用户只能访问自己的资源",
+        }
+        return advice_map.get(vuln_type.lower(), "1. 对漏洞点进行代码审计，定位问题根因\n2. 实施输入验证和输出编码\n3. 参考 OWASP 对应漏洞类型的修复指南")
 
     def _generate_global_reflector_prompt(self, simplified_graph: Dict[str, Any]) -> str:
         """
@@ -951,6 +1270,9 @@ class Reflector:
             if global_reflection_data.get("global_insight"):
                 global_reflection_data["global_insight"]["example_trajectory"] = simplified_graph
 
+            # 新增：全局反思阶段推送钉钉 + 触发停止
+            await self._notify_dingtalk_from_graph(graph_manager)
+
             return global_reflection_data
 
         except (json.JSONDecodeError, ValueError) as e:
@@ -961,3 +1283,81 @@ class Reflector:
                 "global_insight": None,
                 "metrics": None,
             }
+
+    async def _notify_dingtalk_from_graph(self, graph_manager: GraphManager) -> None:
+        """
+        从因果图中提取已确认漏洞，推送钉钉通知并创建停止信号。
+
+        在 reflect() 子任务反思 和 reflect_global() 全局反思 中都会调用，
+        确保无论漏洞在哪个阶段被确认，都能触发推送和停止。
+        """
+        try:
+            from core.dingtalk_notifier import DingTalkNotifier
+            from conf.config import (
+                DINGTALK_ENABLED, DINGTALK_WEBHOOK, DINGTALK_SECRET,
+                DINGTALK_STOP_ON_VULN
+            )
+
+            if not (DINGTALK_ENABLED and DINGTALK_WEBHOOK and DINGTALK_SECRET):
+                return
+
+            # 从因果图中提取所有 ConfirmedVulnerability 节点
+            import networkx as nx
+            confirmed_vulns = []
+            if graph_manager and hasattr(graph_manager, 'causal_graph'):
+                for node_id, data in graph_manager.causal_graph.nodes(data=True):
+                    node_type = data.get("node_type", "")
+                    if node_type in ("ConfirmedVulnerability", "Vulnerability"):
+                        node_data = dict(data)
+                        node_data["id"] = node_id
+                        confirmed_vulns.append(node_data)
+
+            if not confirmed_vulns:
+                return
+
+            notifier = DingTalkNotifier(
+                webhook_url=DINGTALK_WEBHOOK,
+                secret=DINGTALK_SECRET
+            )
+
+            for vuln_node in confirmed_vulns:
+                # 避免重复推送（已推送过的标记为 _dingtalk_notified）
+                if vuln_node.get("_dingtalk_notified"):
+                    continue
+
+                vuln_info = self._extract_vulnerability_info(vuln_node, "")
+
+                success = await notifier.send_vulnerability_alert(vuln_info)
+                if success:
+                    _get_console().print(
+                        f"[DingTalk] 漏洞推送成功: {vuln_info.get('title', 'Unknown')}",
+                        style="bold green"
+                    )
+                    # 标记已推送
+                    if graph_manager and hasattr(graph_manager, 'causal_graph'):
+                        if vuln_node["id"] in graph_manager.causal_graph.nodes:
+                            graph_manager.causal_graph.nodes[vuln_node["id"]]["_dingtalk_notified"] = True
+                else:
+                    _get_console().print(
+                        "[DingTalk] 漏洞推送失败",
+                        style="bold red"
+                    )
+
+                # 创建停止信号
+                if DINGTALK_STOP_ON_VULN and graph_manager and hasattr(graph_manager, 'task_id'):
+                    import os, json, tempfile
+                    halt_file = os.path.join(tempfile.gettempdir(), f"{graph_manager.task_id}.halt")
+                    halt_payload = {
+                        "reason": "vulnerability_confirmed",
+                        "vulnerability": vuln_info,
+                        "timestamp": time.time()
+                    }
+                    with open(halt_file, "w", encoding="utf-8") as f:
+                        json.dump(halt_payload, f, ensure_ascii=False)
+                    _get_console().print(
+                        f"[DingTalk] 已发现有效漏洞，测试任务已自动停止: {vuln_info.get('title', '')}",
+                        style="bold yellow"
+                    )
+
+        except Exception as e:
+            _get_console().print(f"[DingTalk] 推送过程出错: {e}", style="yellow")
