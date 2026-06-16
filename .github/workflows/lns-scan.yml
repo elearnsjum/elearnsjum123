@@ -1,4 +1,4 @@
-name: scan
+name: scanadfsa
 
 on:
   workflow_dispatch:
